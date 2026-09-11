@@ -21,7 +21,8 @@
  * =========================================================
  */
 
-const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent'
+const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent'
+const OPENROUTER_API_BASE = 'https://openrouter.ai/api/v1/chat/completions'
 
 export const PIPELINE_STAGES = [
   { key: 'parsed',     label: 'Evidence Parsed',              detail: 'Evidence files verified and read' },
@@ -34,12 +35,16 @@ export const PIPELINE_STAGES = [
 ]
 
 function getApiKey() {
-  const key = import.meta.env.VITE_GEMINI_API_KEY || ''
-  return (key && key !== 'your_gemini_api_key_here') ? key : null
+  const rawKey = import.meta.env.VITE_GEMINI_API_KEY || import.meta.env.VITE_AI_API_KEY || ''
+  const cleanKey = String(rawKey).replace(/\s+/g, '').trim()
+  return (cleanKey && cleanKey !== 'your_gemini_api_key_here') ? cleanKey : null
 }
 
 /**
- * Core Gemini API caller with retry logic.
+ * Core AI API caller with retry logic.
+ * Automatically supports both:
+ *  - OpenRouter keys (sk-or-v1-..., sk-...) with Gemini 2.5 Flash
+ *  - Native Google Gemini keys (AIzaSy...)
  */
 async function callGemini(systemInstruction, userPrompt, retries = 1) {
   const apiKey = getApiKey()
@@ -47,32 +52,65 @@ async function callGemini(systemInstruction, userPrompt, retries = 1) {
     throw new Error('GEMINI_API_KEY_MISSING')
   }
 
-  const payload = {
-    system_instruction: { parts: [{ text: systemInstruction }] },
-    contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
-    generationConfig: {
+  const isOpenRouter = apiKey.startsWith('sk-')
+
+  let url
+  let headers
+  let body
+
+  if (isOpenRouter) {
+    url = OPENROUTER_API_BASE
+    headers = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+      'HTTP-Referer': 'http://localhost:5173',
+      'X-Title': 'IncidentIQ Cyber Assistant',
+    }
+    body = JSON.stringify({
+      model: 'google/gemini-2.5-flash',
+      messages: [
+        { role: 'system', content: systemInstruction },
+        { role: 'user', content: userPrompt },
+      ],
       temperature: 0.1,
-      responseMimeType: 'application/json',
-    },
+      max_tokens: 1500,
+    })
+  } else {
+    url = `${GEMINI_API_BASE}?key=${apiKey}`
+    headers = { 'Content-Type': 'application/json' }
+    body = JSON.stringify({
+      system_instruction: { parts: [{ text: systemInstruction }] },
+      contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
+      generationConfig: {
+        temperature: 0.1,
+        responseMimeType: 'application/json',
+      },
+    })
   }
 
   let lastError
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const res = await fetch(`${API_BASE}?key=${apiKey}`, {
+      const res = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        headers,
+        body,
       })
 
       if (!res.ok) {
         const errBody = await res.json().catch(() => ({}))
-        const msg = errBody?.error?.message || `HTTP ${res.status}`
-        throw new Error(`Gemini API error: ${msg}`)
+        const msg = errBody?.error?.message || errBody?.message || `HTTP ${res.status}`
+        throw new Error(`AI API error: ${msg}`)
       }
 
       const data = await res.json()
-      const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text || ''
+      let rawText = ''
+
+      if (isOpenRouter) {
+        rawText = data?.choices?.[0]?.message?.content || ''
+      } else {
+        rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text || ''
+      }
 
       try { return JSON.parse(rawText) } catch { /* fall through */ }
 

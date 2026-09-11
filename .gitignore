@@ -29,3 +29,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Backend — database and uploads
+backend/uploads/
+backend/incidentiq.db
+backend/incidentiq.db-shm
+backend/incidentiq.db-wal

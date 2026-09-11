@@ -3,6 +3,7 @@ import { useParams } from 'react-router-dom'
 import { useInvestigation } from '../context/InvestigationContext'
 import { ingestFiles, normalizeEvents, buildEvidenceBundle } from '../services/evidenceParser'
 import { runAnalysisPipeline } from '../services/gemini'
+import { uploadEvidenceFiles, uploadSampleFiles, persistAnalysis } from '../services/api'
 import StepNav from '../components/investigate/StepNav'
 import EvidenceUpload from '../components/investigate/EvidenceUpload'
 import AnalysisPipeline from '../components/investigate/AnalysisPipeline'
@@ -124,7 +125,7 @@ export default function Investigate() {
       updateStage({ stageKey: 'normalized', status: 'complete', data: { eventCount: events.length } })
 
       // ── Step 4: Create investigation record & store events ─────────────
-      const invId = createInvestigation({
+      const invId = await createInvestigation({
         name: incidentName.trim(),
         description: incidentDesc.trim(),
         files: validFiles.map(f => ({ name: f.name, type: f.type, size: f.size })),
@@ -134,6 +135,35 @@ export default function Investigate() {
       invIdRef.current = invId
       setActiveInvestigationId(invId)
       updateInvestigation(invId, { status: 'analyzing', events, parsingSummary: summary })
+
+      // ── Step 4b: Upload evidence files to backend for persistence ────────
+      try {
+        const realFiles = validCandidateFiles
+          .map(f => f.rawFile)
+          .filter(f => f instanceof File)
+
+        const sampleFileItems = validCandidateFiles.filter(f => {
+          const rf = f.rawFile
+          return rf && !(rf instanceof File) && rf.content !== undefined
+        })
+
+        if (realFiles.length > 0) {
+          await uploadEvidenceFiles(invId, realFiles)
+        }
+        if (sampleFileItems.length > 0) {
+          const samplePayload = sampleFileItems.map(f => ({
+            name: f.name,
+            content: f.content || f.rawFile?.content || '',
+            type: f.type,
+            size: f.size,
+          }))
+          await uploadSampleFiles(invId, samplePayload)
+        }
+        console.log('[Investigate] Evidence persisted to backend')
+      } catch (uploadErr) {
+        // Backend persistence failed but analysis can still run in-memory
+        console.warn('[Investigate] Evidence backend upload failed (continuing in-memory):', uploadErr.message)
+      }
 
       // ── Step 5: Build evidence context for AI ──────────────────────────
       const evidenceBundle = buildEvidenceBundle(validFiles)
@@ -161,7 +191,7 @@ export default function Investigate() {
         recommendations:   pipelineResult.recommendations || [],
       }
 
-      // ── Step 8: Persist to context/localStorage ────────────────────────
+      // ── Step 8: Persist to context + backend ──────────────────────────
       updateInvestigation(invId, {
         status:          'complete',
         events:          pipelineResult.events,
@@ -169,6 +199,19 @@ export default function Investigate() {
         recommendations: pipelineResult.recommendations,
         parsingSummary:  summary,
       })
+
+      // ── Step 8b: Persist full analysis result to backend ────────────────
+      try {
+        await persistAnalysis(invId, {
+          analysisResult,
+          recommendations: pipelineResult.recommendations,
+          parsingSummary: summary,
+          status: 'complete',
+        })
+        console.log('[Investigate] Analysis persisted to backend')
+      } catch (persistErr) {
+        console.warn('[Investigate] Analysis backend persist failed (data in localStorage):', persistErr.message)
+      }
 
       // ── Step 9: Build local investigation object ───────────────────────
       const finalInv = {
